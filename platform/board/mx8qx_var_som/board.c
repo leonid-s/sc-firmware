@@ -73,6 +73,9 @@
 #include "dcd/dcd_retention.h"
 #include "drivers/systick/fsl_systick.h"
 
+#include "eeprom.h"
+#include "ddr_table.h"
+
 /* Local Defines */
 
 /*!
@@ -292,15 +295,37 @@ void board_config_debug_uart(sc_bool_t early_phase)
 {
     #if defined(ALT_DEBUG_SCU_UART) && !defined(DEBUG_TERM_EMUL) \
             && defined(DEBUG) && !defined(SIMU)
-        /* Power up UART */
-        pm_force_resource_power_mode_v(SC_R_SC_UART,
-            SC_PM_PW_MODE_ON);
-    
-        /* Check if debug disabled */
-        if (SCFW_DBG_READY == 0U)
+        if ((SCFW_DBG_READY == 0U) && (early_phase == SC_FALSE))
         {
-            main_config_debug_uart(LPUART_DEBUG, SC_24MHZ);
-        }
+		static sc_bool_t banner = SC_FALSE;
+		sc_pm_clock_rate_t rate = SC_24MHZ;
+
+		/* Configure pads */
+		pad_force_mux(SC_P_SCU_GPIO0_00, 1, SC_PAD_CONFIG_NORMAL,
+			SC_PAD_ISO_OFF);
+		pad_force_mux(SC_P_SCU_GPIO0_01, 1, SC_PAD_CONFIG_NORMAL,
+			SC_PAD_ISO_OFF);
+
+		/* Power up and enable clock */
+		pm_force_resource_power_mode_v(SC_R_SC_PID0, SC_PM_PW_MODE_ON);
+		pm_force_resource_power_mode_v(SC_R_DBLOGIC, SC_PM_PW_MODE_ON);
+		pm_force_resource_power_mode_v(SC_R_DB, SC_PM_PW_MODE_ON);
+		pm_force_resource_power_mode_v(SC_R_SC_UART, SC_PM_PW_MODE_ON);
+
+		(void) pm_set_clock_rate(SC_PT, SC_R_SC_UART, SC_PM_CLK_PER, &rate);
+		(void) pm_clock_enable(SC_PT, SC_R_SC_UART, SC_PM_CLK_PER, SC_TRUE, SC_FALSE);
+
+		/* Configure UART */
+		main_config_debug_uart(LPUART_DEBUG, rate);
+
+		if (banner == SC_FALSE)
+		{
+			debug_print(1,
+			"\nHello from SCU (Build %u, Commit %08x, %s %s)\n\n",
+			SCFW_BUILD, SCFW_COMMIT, SCFW_DATE, SCFW_TIME);
+			banner = SC_TRUE;
+		}
+	}
     #elif defined(ALT_DEBUG_UART) && defined(DEBUG) && !defined(SIMU)
         /* Use M4 UART if ALT_DEBUG_UART defined */
         /* Return if debug already enabled */
@@ -559,6 +584,113 @@ sc_err_t board_init_ddr(sc_bool_t early, sc_bool_t ddr_initialized)
 /*--------------------------------------------------------------------------*/
 /* Take action on DDR                                                       */
 /*--------------------------------------------------------------------------*/
+
+/*
+ * Modify DCD table based on the adjustment table in EEPROM
+ *
+ * Assumption: register addresses in the adjustment table
+ * follow the order of register addresses in the original table
+ *
+ * @adj_table_offset - offset of adjustment table from start of EEPROM
+ * @adj_table_size   - number of rows in adjustment table
+ * @table            - pointer to DDR table
+ * @table_size       - number of rows in DDR table
+ */
+static void adjust_dcd_table(struct dram_cfg_param *table, uint8_t table_size)
+{
+	int i, j = 0;
+	uint8_t off;
+	uint8_t adj_table_size;
+	status_t err;
+	struct var_eeprom e;
+	struct dram_cfg_param adj_table_row;
+
+	/* Initialize EEPROM I2C bus */
+	eeprom_i2c_init();
+
+	/* Read EEPROM header */
+	err = eeprom_i2c_read(EEPROM_I2C_ADDRESS, 0, (uint8_t *)&e, sizeof(e));
+	if (err != I32(kStatus_Success)) {
+		board_print(3, "EEPROM read failed, err=%d\n", err);
+		return;
+	}
+
+	/* Check EEPROM validity */
+	if (!var_eeprom_is_valid(&e))
+		return;
+
+	/* Check EEPROM version - only version 4+ has DDR adjustment table */
+	if (e.version < 4) {
+		board_print(3, "EEPROM version is %d\n", e.version);
+		return;
+	}
+
+	/* Calculate DRAM adjustment table size */
+	adj_table_size = (e.off[1] - e.off[0]) / (sizeof(struct dram_cfg_param));
+	board_print(3, "Adjustment table size is %d\n", adj_table_size);
+
+	/* Iterate over the adjustment table */
+	off = e.off[0];
+	for (i = 0; i < adj_table_size; i++) {
+
+		/* Read next entry from the adjustment table */
+		eeprom_i2c_read(EEPROM_I2C_ADDRESS, off,
+				(uint8_t *)&adj_table_row, sizeof(adj_table_row));
+
+		/* Iterate over the DCD table and adjust it */
+		for (; j < table_size; j++) {
+			if ((table[j].cmd == adj_table_row.cmd) &&
+			    (table[j].reg == adj_table_row.reg)) {
+				board_print(3, "Adjusting: cmd=0x%x reg=0x%x val=0x%x\n",
+					adj_table_row.cmd, adj_table_row.reg, adj_table_row.val);
+				table[j].val = adj_table_row.val;
+				break;
+			}
+		}
+
+		off += sizeof(adj_table_row);
+	}
+
+	board_print(3, "Done adjusting DCD table\n");
+}
+
+static void board_dcd_config(void)
+{
+	uint8_t i;
+
+	adjust_dcd_table(dcd_table, dcd_table_size);
+
+	for (i = 0; i < dcd_table_size; i++) {
+		struct dram_cfg_param *p = &dcd_table[i];
+
+		switch (p->cmd) {
+			case DCD_WRITE:
+				DATA4(p->reg, p->val);
+				break;
+			case DCD_SET_BIT:
+				SET_BIT4(p->reg, p->val);
+				break;
+			case DCD_CLR_BIT:
+				CLR_BIT4(p->reg, p->val);
+				break;
+			case DCD_CHECK_BITS_SET:
+				CHECK_BITS_SET4(p->reg, p->val);
+				break;
+			case DCD_CHECK_BITS_CLR:
+				CHECK_BITS_CLR4(p->reg, p->val);
+				break;
+			case DCD_CHECK_ANY_BIT_SET:
+				CHECK_ANY_BIT_SET4(p->reg, p->val);
+				break;
+			case DCD_CHECK_ANY_BIT_CLR:
+				CHECK_ANY_BIT_CLR4(p->reg, p->val);
+				break;
+			default:
+				break;
+		}
+	}
+}
+
 sc_err_t  board_ddr_config(bool rom_caller, board_ddr_action_t action)
 {
     /* Note this is called by the ROM before the SCFW is initialized.
@@ -651,7 +783,7 @@ sc_err_t  board_ddr_config(bool rom_caller, board_ddr_action_t action)
             break;
     #endif
         default:
-            #include "dcd/dcd.h"
+            board_dcd_config();
             break;
     }
 
@@ -1362,7 +1494,7 @@ static void pmic_init(void)
             (void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO3, RUN_EN_STBY_OFF);
             (void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_SW5, SW_RUN_PWM | SW_STBY_PWM);
             (void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_SW7, SW_RUN_PWM | SW_STBY_OFF);
-            (void) PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO2, 1800, REG_RUN_MODE);
+            (void) PMIC_SET_VOLTAGE(PMIC_0_ADDR, PF8100_LDO2, 3300, REG_RUN_MODE);
             (void) PMIC_SET_MODE(PMIC_0_ADDR, PF8100_LDO2, RUN_EN_STBY_OFF);
 
             /* Adjust startup timing */
@@ -1524,19 +1656,87 @@ void board_tick(uint16_t msec)
 /*--------------------------------------------------------------------------*/
 /* Board IOCTL function                                                     */
 /*--------------------------------------------------------------------------*/
-sc_err_t board_ioctl(sc_rm_pt_t caller_pt, sc_rsrc_t mu, uint32_t *parm1,
-    uint32_t *parm2, uint32_t *parm3)
+sc_err_t board_ioctl(sc_rm_pt_t caller_pt, sc_rsrc_t mu, uint32_t *command,
+    uint32_t *p1, uint32_t *p2)
 {
+    int i;
     sc_err_t err = SC_ERR_PARM;
+    uint8_t *buff = (uint8_t *)*p1;
+    uint32_t size = *p2;
+    uint32_t i2c_addr = EEPROM_I2C_ADDRESS;
+
+    always_print("IOCTL Function called! Cmd is %d, Buffer Addr is 0x%08x, Size is 0x%08x\n",
+			*command, *p1, *p2);
 
     /* For test_misc */
-    if (*parm1 == 0xFFFFFFFEU)
-    {
-        *parm1 = *parm2 + *parm3;
-        *parm2 = mu;
-        *parm3 = caller_pt;
+    switch (*command) {
 
-        err = SC_ERR_NONE;
+	case SOMINFO_READ_EEPROM:
+		always_print("EEPROM Read Function called, address=0x%08x!\n", buff);
+		if (size > 0x100) {
+			if (eeprom_i2c_read(i2c_addr, 0x0, buff, 0x100)) {
+				always_print("EEPROM Read FAIL!\n");
+				break;
+			}
+			SystemTimeDelay(20000U);
+			size -= 0x100;
+			buff += 0x100;
+			++i2c_addr;
+		}
+		if (eeprom_i2c_read(i2c_addr, 0x0, buff, size)) {
+			always_print("EEPROM Read FAIL!\n");
+			break;
+		}
+		SystemTimeDelay(20000U);
+		always_print("EEPROM Read Success!\n");
+		err = SC_ERR_NONE;
+		break;
+
+	case SOMINFO_WRITE_EEPROM:
+		always_print("EEPROM Write Function called, address=0x%08x!\n", buff);
+		for (i = 0; i < 16; i++)
+			always_print("data[%d]=0x%x\n", i, buff[i]);
+		i = 0;
+		if (eeprom_i2c_write(EEPROM_I2C_ADDRESS, 0x00, &i, 0x02)) {
+			always_print("EEPROM Magic Erase FAIL!\n");
+			break;
+		}
+
+		SystemTimeDelay(20000U);
+
+		if (eeprom_i2c_write(EEPROM_I2C_ADDRESS, 0x02, buff+0x02, 14)) {
+			always_print("EEPROM Write block 0 FAIL!\n");
+			break;
+		}
+
+		for (i = 1; i < 16; i++) {
+			SystemTimeDelay(20000U);
+			if (eeprom_i2c_write(EEPROM_I2C_ADDRESS, i*16, buff+i*16, 16)) {
+				always_print("EEPROM Write block %d FAIL!\n",i);
+				break;
+			}
+		}
+
+		for (i = 0; i < 16; i++) {
+			SystemTimeDelay(20000U);
+			if (eeprom_i2c_write(EEPROM_I2C_ADDRESS+1, i*16, buff+256+i*16, 16)) {
+				always_print("EEPROM Write block %d FAIL!\n",i+16);
+				break;
+			}
+		}
+
+		SystemTimeDelay(20000U);
+
+		if (eeprom_i2c_write(EEPROM_I2C_ADDRESS, 0x00, buff, 0x02)) {
+			always_print("EEPROM Magic Write FAIL!\n");
+			break;
+		}
+
+		always_print("EEPROM Write Success!\n");
+		err = SC_ERR_NONE;
+		break;
+	default:
+		always_print("Unknown command ID!\n");
     }
 
     return err;
