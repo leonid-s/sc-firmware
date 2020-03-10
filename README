@@ -1,0 +1,20 @@
+Build procedure:
+----------------------------------------------------------------------------------------
+
+
+#!/bin/sh
+export TOOLS=/opt
+
+make clean
+make qx R=B0 B=var_som V=1 #DL=5 U=2 #M=1
+
+echo
+echo
+echo
+echo "Output is :   build_mx8qx_b0/scfw_tcm.bin"
+
+rm platform/board/mx8qx_var_som/dcd/dcd.h
+rm platform/board/mx8qx_var_som/dcd/dcd_retention.h
+rm platform/board/mx8qx_var_som/dcd/imx8qx_dcd_1.2GHz.h
+rm platform/board/mx8qx_var_som/dcd/imx8qx_dcd_1.2GHz_retention.h
+
